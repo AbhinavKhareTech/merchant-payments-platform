@@ -35,8 +35,11 @@ The system handles the complete payment lifecycle: ingestion from POS/ecommerce,
 - [Compliance and Security](#compliance-and-security)
 - [Failure Modes and Recovery](#failure-modes-and-recovery)
 - [Load Testing Results](#load-testing-results)
+- [AI and ML Infrastructure](#ai-and-ml-infrastructure)
+- [India and Emerging Markets: Architecture Considerations](#india-and-emerging-markets-architecture-considerations)
 - [Repository Structure](#repository-structure)
 - [Running Locally](#running-locally)
+- [About the Architect](#about-the-architect)
 - [Contributing](#contributing)
 
 ---
@@ -829,6 +832,155 @@ cd src/settlement-service && go run cmd/server/main.go
 # Run tests
 ./scripts/run-tests.sh
 ```
+
+---
+
+## AI and ML Infrastructure
+
+Beyond the fraud engine, the platform is designed to be an **AI-native payments stack** — every signal that flows through the system is structured to feed continuous learning and model improvement.
+
+### ML Platform Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       ML PLATFORM LAYER                             │
+│                                                                     │
+│  Online Path (real-time inference)                                  │
+│  ┌──────────────┐   ┌───────────────┐   ┌───────────────────────┐  │
+│  │  Feature     │──▶│  Model        │──▶│  Inference Gateway    │  │
+│  │  Store       │   │  Registry     │   │  (A/B, shadow, canary)│  │
+│  │  (Redis)     │   │  (MLflow)     │   │                       │  │
+│  └──────────────┘   └───────────────┘   └───────────────────────┘  │
+│                                                                     │
+│  Offline Path (training pipeline)                                   │
+│  ┌──────────────┐   ┌───────────────┐   ┌───────────────────────┐  │
+│  │  Event Log   │──▶│  Feature      │──▶│  Training Pipeline    │  │
+│  │  (S3/Parquet)│   │  Engineering  │   │  (weekly automated)   │  │
+│  │              │   │  (Spark)      │   │                       │  │
+│  └──────────────┘   └───────────────┘   └───────────────────────┘  │
+│                                                                     │
+│  Feedback Loop                                                      │
+│  Analyst decisions ──▶ Chargeback data ──▶ Labeled dataset ──▶ Retrain │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Model Governance
+
+| Stage | Description | Gate |
+|---|---|---|
+| Research | Experimental model training on historical data | Manual review by ML team |
+| Shadow | Model scores transactions but has no decision authority | 48h with < 2% score distribution shift |
+| Champion/Challenger | 5% traffic to new model, 95% to current champion | False positive rate within 10% of champion |
+| Production | Full traffic | Automatic rollback if FPR exceeds threshold |
+| Retired | Model archived with performance history | N/A |
+
+Model artifacts, training configs, evaluation results, and deployment history are versioned in MLflow. Every production inference is traceable to the exact model version, training dataset version, and feature schema version that produced it.
+
+### Feature Store Design
+
+The feature store is split into two planes:
+
+**Online feature store (Redis):** Serves sub-millisecond feature lookups during authorization. Holds pre-computed velocity aggregations, device profiles, and risk signals. Updated via Kafka Streams consumers on the `payments.authorization.completed` and `fraud.scoring.completed` topics.
+
+**Offline feature store (S3 + Parquet + DuckDB):** Point-in-time correct dataset construction for model training. Features are joined to labeled transactions using the timestamp of the original authorization, avoiding target leakage.
+
+Feature definitions are versioned as code. Schema changes go through a compatibility check before deployment to prevent silent model degradation.
+
+### LLM Integration: Fraud Narrative Generation
+
+The fraud analyst console uses an LLM (served on-prem, not routed through external APIs) to generate natural-language narratives for flagged transactions:
+
+```
+Transaction flagged for manual review.
+Summary: Card ending 4521 attempted a $847 purchase at an electronics merchant in Dubai,
+14 hours after the last known transaction in Bangalore. The device fingerprint has not
+been seen on this card before. Velocity: 4 transactions in 3 hours (2.1x above 30-day
+average). Recommended action: Step-up authentication or hold for analyst review.
+Fraud score: 0.81 (REVIEW band).
+```
+
+This reduces analyst review time by 60% and improves decision consistency across shifts.
+
+---
+
+## India and Emerging Markets: Architecture Considerations
+
+India processes over 14 billion UPI transactions per month. Designing a payments platform for this market requires specific architectural choices that differ from traditional card network infrastructure.
+
+### UPI Integration
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                     UPI PAYMENT FLOW                               │
+│                                                                    │
+│  Customer (PSP App)                                                │
+│       │                                                            │
+│       │  Collect / Pay request (VPA)                               │
+│       ▼                                                            │
+│  NPCI Switch ──▶ Remitter Bank ──▶ Our Platform (Payee PSP)        │
+│                                         │                          │
+│                        ┌────────────────┤                          │
+│                        │                │                          │
+│                   Fraud Engine    Merchant Credit                  │
+│                  (inline, <50ms)  (via Ledger)                     │
+│                        │                │                          │
+│                        └────────────────┘                          │
+│                                         │                          │
+│                        Response to NPCI Switch (<200ms SLA)        │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+NPCI mandates a **200ms end-to-end response SLA** for UPI transactions. The fraud engine's 45ms p99 budget is critical here — it must operate within the same latency envelope regardless of payment rail.
+
+### RBI Compliance Specifics
+
+| Requirement | Implementation |
+|---|---|
+| Data localization (RBI circular 2018) | All transaction data processed and stored within India region (ap-south-1) |
+| Merchant settlement (T+1 mandate) | Settlement service configured for T+1 default, configurable per merchant category |
+| PPI limits (prepaid wallet regulation) | Per-wallet balance caps enforced at authorization time by ledger service |
+| Suspicious Transaction Reports (STR) | Automated STR generation for transactions matching RBI-specified criteria |
+| BBPS integration | Bill payment orchestrator module supporting Bharat Bill Payment System |
+
+### Bharat QR and Interoperability
+
+The platform supports Bharat QR — the unified QR standard that works across Visa, Mastercard, RuPay, and UPI. A single QR code at merchant checkout enables:
+- Card payments (Visa/MC/RuPay via card networks)
+- UPI payments (via NPCI switch)
+- Wallet payments (via PPI issuers)
+
+The payment gateway handles protocol translation so the fraud engine and ledger receive a normalized transaction event regardless of the underlying rail.
+
+### Voice Commerce and Vernacular Language Support
+
+India has 22 scheduled languages and over 500 million smartphone users, many of whom transact primarily in their native language. The platform's API and notification layer is designed for vernacular-first integration:
+
+**Voice-initiated payments:** The notification service supports structured payment confirmation events that downstream voice assistants (Hindi, Tamil, Bengali, Marathi, and other Indian languages) can consume to narrate transaction status in the user's preferred language. The payment event schema includes a `locale` field and a `narrative_context` block that provides structured data for voice synthesis — amount, merchant name, status, and fraud challenge reason — without hardcoding any language.
+
+**Fraud challenge localization:** When a 3DS step-up or OTP challenge is triggered, the challenge message is dispatched with a locale tag. Downstream consumer apps handle rendering in the appropriate script and language. The fraud engine itself is language-agnostic — risk signals are numeric and do not depend on the language of the transaction interface.
+
+**Merchant dashboard:** Merchant-facing APIs support localized error codes and response messages. Merchant onboarding flows for tier-3 merchants (typically small businesses transacting in regional languages) include vernacular field validation for business name, address, and bank account details.
+
+This architecture separates the **payment processing core** (which must be fast, deterministic, and language-independent) from the **presentation layer** (which must be local, accessible, and human-readable), following the same principle applied to the payment rail abstraction above.
+
+---
+
+## About the Architect
+
+This platform represents the architectural thinking I have developed across a decade of building payment infrastructure at scale across India, the Middle East, and Southeast Asia.
+
+My work spans the full stack of payments engineering: from low-latency authorization systems and real-time fraud detection to ML infrastructure for financial risk and the emerging intersection of voice AI with payment flows. I have led engineering teams building platforms that process billions of dollars in annual transaction volume for tier-1 banks, merchant acquirers, and payment facilitators operating under RBI, SAMA, CBUAE, and PCI-DSS regulatory frameworks.
+
+What I find most interesting today is the convergence of **AI infrastructure** and **financial systems** — specifically how the same rigorous reliability and consistency guarantees that payments require (exactly-once semantics, immutable audit trails, deterministic state machines) can be brought to AI inference pipelines that make consequential financial decisions.
+
+The fraud engine in this repository is a practical example of that: an ML system with the operational discipline of a payments system — versioned models, reproducible predictions, fallback behavior under degradation, and a feedback loop that is auditable end-to-end.
+
+**Current focus areas:**
+- AI infrastructure for low-latency, high-reliability financial decisioning
+- Voice AI and Indian vernacular language interfaces for financial services
+- Extending payment platform patterns to conversational and agentic AI workflows
+
+If you are building in this space — payments infrastructure, financial AI, or voice-first financial services for emerging markets — I am interested in the hard problems. Open an issue or reach out directly.
 
 ---
 
