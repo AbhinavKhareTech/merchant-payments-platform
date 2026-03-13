@@ -1,0 +1,9 @@
+# De-emphasize Go files so Java becomes dominant
+*.go linguist-detectable=false
+
+# Ensure Java files are strongly detected (optional but reinforces)
+*.java linguist-detectable=true
+*.java linguist-language=Java
+
+# Optional: if you want to hide Terraform/HCL too
+*.tf linguist-detectable=false
