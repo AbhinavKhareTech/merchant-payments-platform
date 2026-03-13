@@ -1,0 +1,571 @@
+openapi: 3.1.0
+info:
+  title: Merchant Payments Platform API
+  version: 1.0.0
+  description: |
+    Payment processing API with integrated real-time fraud detection.
+    
+    All monetary amounts are expressed in minor units (e.g., cents for USD)
+    with an explicit exponent field. This avoids floating point precision
+    issues in financial calculations.
+    
+    Every mutating endpoint requires an idempotency key to prevent
+    duplicate processing from network retries.
+  contact:
+    name: Abhinav Khare
+    url: https://github.com/AbhinavKhareTech
+
+servers:
+  - url: https://api.payments.example.com
+    description: Production
+  - url: https://sandbox.payments.example.com
+    description: Sandbox
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/payments/authorize:
+    post:
+      summary: Authorize a payment
+      description: |
+        Initiates a payment authorization. The system validates the request,
+        scores it for fraud risk, and submits to the card network for approval.
+        
+        On success, an authorization hold is placed on the cardholder's account.
+        The hold must be captured within the expiry window (default: 7 days)
+        or it will be automatically released.
+      operationId: authorizePayment
+      tags: [Payments]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthorizationRequest'
+      responses:
+        '200':
+          description: Authorization result (approved, declined, or step-up required)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/payments/{payment_id}/capture:
+    post:
+      summary: Capture an authorized payment
+      description: |
+        Captures a previously authorized payment, initiating the settlement process.
+        Supports partial capture (amount <= authorized amount).
+        Remaining authorization hold is released on partial capture.
+      operationId: capturePayment
+      tags: [Payments]
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaptureRequest'
+      responses:
+        '200':
+          description: Capture successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Payment not found
+        '409':
+          description: Payment already captured or expired
+
+  /v1/payments/{payment_id}/refund:
+    post:
+      summary: Refund a captured payment
+      description: |
+        Issues a full or partial refund for a captured payment.
+        Refund amount must not exceed the captured amount minus any
+        previous refunds.
+      operationId: refundPayment
+      tags: [Payments]
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '200':
+          description: Refund processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefundResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Payment not found
+        '422':
+          description: Refund amount exceeds captured balance
+
+  /v1/payments/{payment_id}:
+    get:
+      summary: Get payment details
+      description: Returns the current state of a payment including risk assessment and timeline.
+      operationId: getPayment
+      tags: [Payments]
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+      responses:
+        '200':
+          description: Payment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentDetails'
+        '404':
+          description: Payment not found
+
+  /v1/fraud/reviews:
+    get:
+      summary: List fraud reviews
+      description: Returns transactions flagged for manual fraud review.
+      operationId: listFraudReviews
+      tags: [Fraud]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, declined]
+          description: Filter by review status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Pagination cursor from previous response
+      responses:
+        '200':
+          description: List of fraud reviews
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FraudReviewList'
+
+  /v1/fraud/reviews/{review_id}/decision:
+    post:
+      summary: Submit fraud review decision
+      description: Records an analyst's decision on a flagged transaction.
+      operationId: submitFraudDecision
+      tags: [Fraud]
+      parameters:
+        - name: review_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FraudDecisionRequest'
+      responses:
+        '200':
+          description: Decision recorded
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API key issued during merchant onboarding
+
+  parameters:
+    IdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Client-generated unique key for request deduplication
+
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Unique request identifier for distributed tracing
+
+    PaymentId:
+      name: payment_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Payment identifier returned from authorization
+
+  schemas:
+    Money:
+      type: object
+      required: [value, currency, exponent]
+      properties:
+        value:
+          type: integer
+          format: int64
+          description: Amount in minor units (e.g., cents)
+          example: 10000
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO 4217 currency code
+          example: USD
+        exponent:
+          type: integer
+          description: Decimal exponent (2 for USD/EUR, 3 for KWD/BHD, 0 for JPY)
+          example: 2
+
+    AuthorizationRequest:
+      type: object
+      required: [idempotency_key, merchant_id, amount, payment_method]
+      properties:
+        idempotency_key:
+          type: string
+          description: Unique key for this authorization attempt
+        merchant_id:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Money'
+        payment_method:
+          $ref: '#/components/schemas/PaymentMethod'
+        billing_address:
+          $ref: '#/components/schemas/Address'
+        shipping_address:
+          $ref: '#/components/schemas/Address'
+        device:
+          $ref: '#/components/schemas/DeviceInfo'
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+
+    AuthorizationResponse:
+      type: object
+      properties:
+        payment_id:
+          type: string
+        status:
+          type: string
+          enum: [authorized, declined, step_up_required]
+        amount:
+          $ref: '#/components/schemas/Money'
+        authorization_code:
+          type: string
+        decline_reason:
+          type: string
+        risk:
+          $ref: '#/components/schemas/RiskAssessment'
+        step_up:
+          $ref: '#/components/schemas/StepUpDetails'
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        idempotency_key:
+          type: string
+
+    RiskAssessment:
+      type: object
+      properties:
+        score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        decision:
+          type: string
+          enum: [approve, approve_flag, step_up, review, decline]
+        factors:
+          type: array
+          items:
+            type: string
+
+    StepUpDetails:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [three_ds, otp, biometric]
+        redirect_url:
+          type: string
+          format: uri
+        expires_at:
+          type: string
+          format: date-time
+
+    PaymentMethod:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [card, wallet, bank_transfer]
+        card:
+          type: object
+          properties:
+            number_token:
+              type: string
+              description: Tokenized card number (never raw PAN)
+            expiry_month:
+              type: integer
+            expiry_year:
+              type: integer
+            cvv_provided:
+              type: boolean
+
+    Address:
+      type: object
+      properties:
+        line1:
+          type: string
+        line2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        postal_code:
+          type: string
+        country:
+          type: string
+          pattern: '^[A-Z]{2}$'
+
+    DeviceInfo:
+      type: object
+      properties:
+        fingerprint:
+          type: string
+        ip_address:
+          type: string
+          format: ipv4
+        user_agent:
+          type: string
+
+    CaptureRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+
+    CaptureResponse:
+      type: object
+      properties:
+        payment_id:
+          type: string
+        status:
+          type: string
+          enum: [captured]
+        captured_amount:
+          $ref: '#/components/schemas/Money'
+        captured_at:
+          type: string
+          format: date-time
+
+    RefundRequest:
+      type: object
+      required: [idempotency_key, amount, reason]
+      properties:
+        idempotency_key:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          enum: [customer_request, duplicate, product_not_received, product_defective, other]
+
+    RefundResponse:
+      type: object
+      properties:
+        refund_id:
+          type: string
+        payment_id:
+          type: string
+        status:
+          type: string
+          enum: [refunded]
+        refunded_amount:
+          $ref: '#/components/schemas/Money'
+        refunded_at:
+          type: string
+          format: date-time
+
+    PaymentDetails:
+      type: object
+      properties:
+        payment_id:
+          type: string
+        status:
+          type: string
+          enum: [initiated, authorized, captured, refunded, declined, expired]
+        amount:
+          $ref: '#/components/schemas/Money'
+        captured_amount:
+          $ref: '#/components/schemas/Money'
+        refunded_amount:
+          $ref: '#/components/schemas/Money'
+        risk:
+          $ref: '#/components/schemas/RiskAssessment'
+        authorization_code:
+          type: string
+        merchant_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        captured_at:
+          type: string
+          format: date-time
+        refunded_at:
+          type: string
+          format: date-time
+        timeline:
+          type: array
+          items:
+            type: object
+            properties:
+              event:
+                type: string
+              timestamp:
+                type: string
+                format: date-time
+              details:
+                type: object
+
+    FraudReviewList:
+      type: object
+      properties:
+        reviews:
+          type: array
+          items:
+            $ref: '#/components/schemas/FraudReview'
+        next_cursor:
+          type: string
+        total_count:
+          type: integer
+
+    FraudReview:
+      type: object
+      properties:
+        review_id:
+          type: string
+        payment_id:
+          type: string
+        merchant_id:
+          type: string
+        amount:
+          $ref: '#/components/schemas/Money'
+        risk_score:
+          type: number
+        risk_factors:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [pending, approved, declined]
+        flagged_at:
+          type: string
+          format: date-time
+
+    FraudDecisionRequest:
+      type: object
+      required: [decision, analyst_id]
+      properties:
+        decision:
+          type: string
+          enum: [approve, decline]
+        analyst_id:
+          type: string
+        notes:
+          type: string
+        update_rule:
+          type: boolean
+          default: false
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [invalid_request, authentication_error, rate_limit, processing_error]
+            code:
+              type: string
+            message:
+              type: string
+            param:
+              type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnprocessableEntity:
+      description: Business rule violation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until rate limit resets
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
